@@ -1,0 +1,299 @@
+import asyncio
+import logging
+
+import discord
+from discord.ext import commands
+from dotenv import load_dotenv
+
+from bot.config.settings import settings
+from bot.database.manager import db
+from bot.services.logging_service import LoggingService
+from bot.services.economy_service import EconomyService
+from bot.services.application_service import ApplicationService
+from bot.services.ticket_service import TicketService
+from bot.services.game_service import GameService
+
+# Import the service modules themselves.
+# These modules contain global service instances that the cogs use.
+import bot.services.logging_service as logging_module
+import bot.services.economy_service as economy_module
+import bot.services.application_service as application_module
+import bot.services.ticket_service as ticket_module
+import bot.services.game_service as game_module
+
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("viper")
+
+
+class ViperBot(commands.Bot):
+
+    def __init__(self):
+        intents = discord.Intents.all()
+
+        super().__init__(
+            command_prefix=settings.PREFIX,
+            intents=intents,
+            case_insensitive=True,
+            help_command=None
+        )
+
+        self.logging_service = None
+        self.economy_service = None
+        self.application_service = None
+        self.ticket_service = None
+        self.game_service = None
+
+    async def setup_hook(self):
+
+        # ========================================
+        # 1. DATABASE
+        # ========================================
+
+        await db.connect()
+        logger.info("✅ Database connected.")
+
+        # ========================================
+        # 2. SERVICES
+        # ========================================
+
+        self.logging_service = LoggingService(self)
+
+        # Make the service available to cogs
+        logging_module.logging_service = self.logging_service
+
+        self.economy_service = EconomyService(
+            self.logging_service
+        )
+
+        economy_module.economy_service = self.economy_service
+
+        self.application_service = ApplicationService(
+            self.logging_service
+        )
+
+        application_module.application_service = self.application_service
+
+        self.ticket_service = TicketService(
+            self.logging_service
+        )
+
+        ticket_module.ticket_service = self.ticket_service
+
+        self.game_service = GameService(
+            self.economy_service
+        )
+
+        game_module.game_service = self.game_service
+
+        logger.info("✅ Services initialized.")
+
+        # ========================================
+        # 3. PREFIX COGS
+        # ========================================
+
+        cogs = [
+            "bot.cogs.economy",
+            "bot.cogs.games",
+            "bot.cogs.applications",
+            "bot.cogs.admin",
+        ]
+
+        for cog in cogs:
+            try:
+                await self.load_extension(cog)
+                logger.info(f"✅ Loaded cog: {cog}")
+
+            except Exception as e:
+                logger.exception(
+                    f"❌ Failed to load cog {cog}: {e}"
+                )
+
+        # ========================================
+        # 4. PERSISTENT VIEWS
+        # ========================================
+
+        try:
+            from bot.views.ticket_views import (
+                TicketPanelView,
+                TicketCategoryView
+            )
+
+            self.add_view(TicketPanelView())
+            self.add_view(TicketCategoryView())
+
+            logger.info("✅ Persistent ticket views registered.")
+
+        except Exception as e:
+            logger.exception(
+                f"❌ Failed to register persistent views: {e}"
+            )
+
+        # ========================================
+        # 5. NO SLASH COMMAND SYNC
+        # ========================================
+        #
+        # This bot uses PREFIX commands only.
+        # Therefore we intentionally do NOT call:
+        #
+        # await self.tree.sync()
+        #
+        # Commands are used like:
+        # !balance
+        # !daily
+        # !pay
+        # !leaderboard
+        # !bj
+        # !ttt
+        # !spin
+        #
+
+        logger.info("✅ Prefix command mode enabled.")
+
+    async def on_ready(self):
+
+        logger.info(
+            f"🚀 Viper Bot is online as {self.user}"
+        )
+
+        logger.info(
+            f"📡 Connected to {len(self.guilds)} server(s)."
+        )
+
+        logger.info(
+            f"⌨️ Prefix: {settings.PREFIX}"
+        )
+
+        await self.change_presence(
+            activity=discord.Game(
+                name=f"Viper | {settings.PREFIX}help"
+            )
+        )
+
+
+async def main():
+
+    load_dotenv()
+
+    bot = ViperBot()
+
+    async with bot:
+        await bot.start(settings.TOKEN)
+
+
+if __name__ == "__main__":
+
+    try:
+        asyncio.run(main())
+
+    except KeyboardInterrupt:
+        logger.info("🛑 Bot stopped.")
+
+    except Exception as e:
+        logger.exception(
+            f"❌ Fatal bot error: {type(e).__name__}: {e}"rt os
+import asyncio
+import logging
+from dotenv import load_dotenv
+
+from bot.config.settings import settings
+from bot.database.manager import db
+from bot.services.logging_service import LoggingService
+from bot.services.economy_service import EconomyService
+from bot.services.application_service import ApplicationService
+from bot.services.ticket_service import TicketService
+from bot.services.game_service import GameService
+
+# Setup Logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("viper")
+
+class ViperBot(commands.Bot):
+    def __init__(self):
+        intents = discord.Intents.all()
+        super().__init__(
+            command_prefix=settings.PREFIX,
+            intents=intents,
+            help_command=None
+        )
+
+        # Initialize Services
+        self.logging_service = None
+        self.economy_service = None
+        self.application_service = None
+        self.ticket_service = None
+        self.game_service = None
+
+    async def setup_hook(self):
+        # 1. Connect Database
+        await db.connect()
+        logger.info("✅ Database connected.")
+
+        # 2. Initialize Services
+        self.logging_service = LoggingService(self)
+        from bot.services.logging_service import logging_service
+        import bot.services.logging_service as ls
+        ls.logging_service = self.logging_service
+
+        self.economy_service = EconomyService(self.logging_service)
+        from bot.services.economy_service import economy_service as es
+        es.economy_service = self.economy_service
+
+        self.application_service = ApplicationService(self.logging_service)
+        from bot.services.application_service import application_service as aserv
+        aserv.application_service = self.application_service
+
+        self.ticket_service = TicketService(self.logging_service)
+        from bot.services.ticket_service import ticket_service as ts
+        ts.ticket_service = self.ticket_service
+
+        self.game_service = GameService(self.economy_service)
+        from bot.services.game_service import game_service as gs
+        gs.game_service = self.game_service
+
+        # 3. Load Cogs
+        # We'll manually load the cogs we've created
+        cogs = [
+            "bot.cogs.economy",
+            "bot.cogs.games",
+            "bot.cogs.applications",
+            "bot.cogs.admin" # We should create this one to match the plan
+        ]
+
+        for cog in cogs:
+            try:
+                await self.load_extension(cog)
+                logger.info(f"Loaded cog: {cog}")
+            except Exception as e:
+                logger.error(f"Failed to load cog {cog}: {e}")
+
+        # 4. Register Persistent Views
+        from bot.views.ticket_views import TicketPanelView, TicketCategoryView
+        from bot.views.application_views import ApplicationReviewView
+
+        self.add_view(TicketPanelView())
+        self.add_view(TicketCategoryView())
+        # App review views are usually dynamic, but we can register the class if needed
+
+        # 5. Sync Slash Commands
+        try:
+            synced = await self.tree.sync()
+            logger.info(f"Synced {len(synced)} slash commands.")
+        except Exception as e:
+            logger.error(f"Failed to sync commands: {e}")
+
+    async def on_ready(self):
+        logger.info(f"🚀 Viper Bot is online as {self.user}")
+        await self.change_presence(activity=discord.Game(name="Viper | /help"))
+
+async def main():
+    load_dotenv()
+    bot = ViperBot()
+    async with bot:
+        await bot.start(settings.TOKEN)
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass

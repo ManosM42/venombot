@@ -1,0 +1,23 @@
+# Ignore git
+.git
+.gitignore
+
+# Ignore python cache
+**/__pycache__/
+*.py[cod]
+*$py.class
+
+# Ignore environment secrets
+.env
+.env.local
+
+# Ignore local database
+viper_database.db
+bot_database.db
+
+# Ignore IDE settings
+.vscode/
+.idea/
+
+# Ignore OS files
+.DS_Store
