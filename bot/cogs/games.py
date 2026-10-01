@@ -1,10 +1,15 @@
+import os
 import random
+import asyncio
 import discord
 from discord.ext import commands
 from dataclasses import dataclass
+from dotenv import load_dotenv
 
 from bot.services.economy_service import economy_service
 from bot.config.settings import settings
+
+load_dotenv()
 
 
 # =================================================================
@@ -389,6 +394,220 @@ class BlackjackView(discord.ui.View):
 
 
 # =================================================================
+# SPIN — Venom Shop reward wheel (no bet, 3h cooldown, opens a ticket on win)
+# =================================================================
+
+def _env_int(name: str) -> int:
+    try:
+        return int(os.getenv(name, "0"))
+    except (TypeError, ValueError):
+        return 0
+
+SPIN_CATEGORY_ID = _env_int("SPIN_CATEGORY_ID")
+LOG_CHANNEL_ID = _env_int("LOG_CHANNEL_ID")
+FOUNDER_ROLE_ID = _env_int("FOUNDER_ROLE_ID")
+COFOUNDER_ROLE_ID = _env_int("COFOUNDER_ROLE_ID")
+STAFF_ROLE_ID = _env_int("STAFF_ROLE_ID")
+
+SPIN_BRAND = "Venom Shop"
+SPIN_GLASS = 0x8FD3FF
+SPIN_GOLD = 0xFFD37A
+SPIN_GREEN = 0x7CFFCB
+SPIN_RED = 0xFF8FA3
+SPIN_SEP = "▱▰▱▰▱▰▱▰▱▰▱▰▱▰▱▰▱▰▱▰"
+
+SPIN_COOLDOWN_SECONDS = 3 * 60 * 60  # 3 hours
+
+# weight = chance in %. "Nothing" silently absorbs whatever % is left over.
+SPIN_REWARDS = [
+    {"name": "Custom Design",        "emoji": "🎨", "weight": 0.1},
+    {"name": "14 Days Free Promo",   "emoji": "🚀", "weight": 0.3},
+    {"name": "VIP Role",             "emoji": "⭐", "weight": 0.5},
+    {"name": "Free Boosts Reward",   "emoji": "💎", "weight": 1.5},
+    {"name": "DM ALL BOT",           "emoji": "📨", "weight": 2.0},
+    {"name": "1.000 Coins",          "emoji": "🪙", "weight": 5.0},
+    {"name": "500 Coins",            "emoji": "🪙", "weight": 10.0},
+]
+
+
+def _roll_spin_reward():
+    total_weighted = sum(r["weight"] for r in SPIN_REWARDS)
+    nothing_weight = max(0.0, 100.0 - total_weighted)
+    pool = SPIN_REWARDS + [{"name": "Nothing", "emoji": "💨", "weight": nothing_weight}]
+    weights = [r["weight"] for r in pool]
+    return random.choices(pool, weights=weights, k=1)[0]
+
+
+def _find_role(guild: discord.Guild, role_id: int, *names: str):
+    if role_id:
+        role = guild.get_role(role_id)
+        if role:
+            return role
+    lowered = [n.lower() for n in names]
+    for role in guild.roles:
+        clean = role.name.lower().strip()
+        if any(clean == n or clean.startswith(n) for n in lowered):
+            return role
+    return None
+
+
+def _get_spin_roles(guild: discord.Guild):
+    founder = _find_role(guild, FOUNDER_ROLE_ID, "founder")
+    cofounder = _find_role(guild, COFOUNDER_ROLE_ID, "co founder", "co-founder", "cofounder")
+    staff = _find_role(guild, STAFF_ROLE_ID, "staff team", "staff")
+    return founder, cofounder, staff
+
+
+def _can_close_spin(member: discord.Member) -> bool:
+    if member.guild_permissions.administrator:
+        return True
+    founder, _cofounder, staff = _get_spin_roles(member.guild)
+    allowed = {r.id for r in (founder, staff) if r}
+    return any(r.id in allowed for r in member.roles)
+
+
+def _spin_topic_owner_id(channel: discord.TextChannel):
+    if channel.topic and channel.topic.startswith("spin-owner:"):
+        try:
+            return int(channel.topic.split(":")[1].split("|")[0])
+        except ValueError:
+            return None
+    return None
+
+
+def _safe_name(text: str) -> str:
+    cleaned = "".join(c for c in text.lower() if c.isalnum() or c in "-_")
+    return cleaned[:30] or "user"
+
+
+def _format_cooldown(seconds: float) -> str:
+    seconds = int(seconds)
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h {minutes}m"
+    if minutes:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
+
+
+class SpinControlView(discord.ui.View):
+    """Persistent close/cancel buttons for spin-reward tickets."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Close", emoji="🔒", style=discord.ButtonStyle.danger,
+                       custom_id="venom:spin:close")
+    async def close_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not _can_close_spin(interaction.user):
+            return await interaction.response.send_message(
+                "❌ Only **Staff** and **Founder** can close this.", ephemeral=True
+            )
+        try:
+            await interaction.response.send_message("🔒 Closing in **5 seconds**...")
+        except discord.NotFound:
+            return
+        await asyncio.sleep(5)
+        try:
+            await interaction.channel.delete(reason=f"Spin ticket closed by {interaction.user}")
+        except discord.HTTPException:
+            pass
+
+    @discord.ui.button(label="Cancel", emoji="🗑️", style=discord.ButtonStyle.secondary,
+                       custom_id="venom:spin:cancel")
+    async def cancel_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        owner_id = _spin_topic_owner_id(interaction.channel)
+        if interaction.user.id != owner_id and not _can_close_spin(interaction.user):
+            return await interaction.response.send_message(
+                "❌ Only the ticket owner or staff can cancel this.", ephemeral=True
+            )
+        try:
+            await interaction.response.send_message("🗑️ Cancelling in **5 seconds**...")
+        except discord.NotFound:
+            return
+        await asyncio.sleep(5)
+        try:
+            await interaction.channel.delete(reason=f"Spin ticket cancelled by {interaction.user}")
+        except discord.HTTPException:
+            pass
+
+
+async def _create_spin_ticket(ctx: commands.Context, reward: dict):
+    guild = ctx.guild
+    user = ctx.author
+
+    founder, cofounder, staff = _get_spin_roles(guild)
+
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        user: discord.PermissionOverwrite(view_channel=True, send_messages=True,
+                                          read_message_history=True, attach_files=True,
+                                          embed_links=True),
+        guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True,
+                                              read_message_history=True, manage_channels=True,
+                                              manage_messages=True, embed_links=True,
+                                              attach_files=True),
+    }
+    for role in (founder, cofounder, staff):
+        if role:
+            overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True,
+                                                           read_message_history=True,
+                                                           attach_files=True, embed_links=True)
+
+    category = guild.get_channel(SPIN_CATEGORY_ID) if SPIN_CATEGORY_ID else None
+    if category is not None and not isinstance(category, discord.CategoryChannel):
+        category = None
+
+    try:
+        channel = await guild.create_text_channel(
+            name=f"spin-{_safe_name(user.name)}",
+            category=category,
+            overwrites=overwrites,
+            topic=f"spin-owner:{user.id}",
+            reason=f"Spin reward ticket for {user}",
+        )
+    except discord.HTTPException:
+        await ctx.send("❌ I couldn't create the ticket channel. Check my permissions.")
+        return None
+
+    embed = discord.Embed(
+        title=f"{reward['emoji']}  Spin Reward — Redeem",
+        description=f"{SPIN_SEP}\n\nCongratulations {user.mention}! 🎉\n\n{SPIN_SEP}",
+        color=SPIN_GOLD,
+        timestamp=discord.utils.utcnow(),
+    )
+    embed.add_field(name="🎁 Reward", value=f"```{reward['name']}```", inline=True)
+    embed.add_field(name="👤 Won by", value=user.mention, inline=True)
+    embed.set_author(name=f"{SPIN_BRAND} • Spin Redeem")
+    embed.set_thumbnail(url=user.display_avatar.url)
+    embed.set_footer(text="Staff will verify and process this reward shortly.")
+
+    pings = [user.mention] + [r.mention for r in (founder, staff, cofounder) if r]
+    await channel.send(
+        content=" ".join(pings),
+        embed=embed,
+        view=SpinControlView(),
+        allowed_mentions=discord.AllowedMentions(users=True, roles=True),
+    )
+    return channel
+
+
+async def _animate_spin(ctx: commands.Context):
+    frames = ["🎰 | ❔ ❔ ❔", "🎰 | 🍀 ❔ ❔", "🎰 | 🍀 🎲 ❔"]
+    embed = discord.Embed(title="🎰  Spinning...", description=frames[0], color=SPIN_GLASS)
+    msg = await ctx.send(embed=embed)
+    for frame in frames[1:]:
+        await asyncio.sleep(0.6)
+        embed.description = frame
+        try:
+            await msg.edit(embed=embed)
+        except discord.HTTPException:
+            pass
+    return msg
+
+
+# =================================================================
 # GAMES COG
 # =================================================================
 
@@ -534,8 +753,6 @@ class GamesCog(commands.Cog):
             dealer_text = f"`{view.dealer_cards[0]}`  🂠"
             dealer_value = "?"
 
-        player_bar = "🟩" * min(player_value, 21) // 3 if False else ""  # unused, kept simple below
-
         embed = discord.Embed(
             title="🃏 ✨ B L A C K J A C K ✨",
             description=(
@@ -610,123 +827,79 @@ class GamesCog(commands.Cog):
         await ctx.send(embed=self.create_bj_embed(view), view=view)
 
     # -------------------------------------------------------------
-    # SPIN
+    # SPIN — reward wheel, 3h cooldown, opens a ticket on any win
     # -------------------------------------------------------------
 
-    SPIN_TABLE = [
-        (0.20, 0, "💀 Nothing", "Red"),
-        (0.35, 0.5, "😬 Small loss", "Red"),
-        (0.20, 1, "🤝 Break even", "White"),
-        (0.15, 2, "🎉 Nice win", "Green"),
-        (0.07, 5, "🔥 Big win", "Yellow"),
-        (0.03, 10, "💎 JACKPOT", "Gold"),
-    ]
-
-    def get_spin_result(self):
-        roll = random.random()
-        cumulative = 0.0
-        for weight, mult, label, color_name in self.SPIN_TABLE:
-            cumulative += weight
-            if roll <= cumulative:
-                return mult, label, color_name
-        return 0, "💀 Nothing", "Red"
-
-    @commands.command(name="spin", aliases=["slots"])
-    async def spin(self, ctx, bet: int = None):
+    @commands.command(name="spin")
+    @commands.cooldown(1, SPIN_COOLDOWN_SECONDS, commands.BucketType.user)
+    async def spin(self, ctx: commands.Context):
         """
-        Spin the wheel.
+        Spin the Venom Shop reward wheel. One spin every 3 hours.
 
         Usage:
-            !spin 100
+            !spin
         """
 
         if ctx.guild is None:
-            return await ctx.send("❌ Το game είναι διαθέσιμο μόνο μέσα σε server.")
+            return await ctx.send("❌ Το spin είναι διαθέσιμο μόνο μέσα σε server.")
 
-        if bet is None:
+        msg = await _animate_spin(ctx)
+        reward = _roll_spin_reward()
+
+        await asyncio.sleep(0.4)
+
+        if reward["name"] == "Nothing":
+            result = discord.Embed(
+                title="🎰  Spin Result",
+                description=(f"{SPIN_SEP}\n\n{reward['emoji']} **{reward['name']}**\n\n"
+                             "Better luck next time!\n\n"
+                             f"Come back in **3 hours**.\n\n{SPIN_SEP}"),
+                color=SPIN_RED,
+            )
+            result.set_footer(text=f"{SPIN_BRAND} • Spin")
+            await msg.edit(embed=result)
+            return
+
+        result = discord.Embed(
+            title="🎉  You Won!",
+            description=(f"{SPIN_SEP}\n\n{reward['emoji']} **{reward['name']}**\n\n"
+                         "Opening a ticket to redeem your reward...\n\n"
+                         f"{SPIN_SEP}"),
+            color=SPIN_GREEN,
+        )
+        result.set_footer(text=f"{SPIN_BRAND} • Spin")
+        await msg.edit(embed=result)
+
+        channel = await _create_spin_ticket(ctx, reward)
+        if channel:
+            go = discord.Embed(description=f"🎫 {channel.mention}", color=SPIN_GREEN)
+            await ctx.send(embed=go)
+
+        if LOG_CHANNEL_ID:
+            log_channel = ctx.guild.get_channel(LOG_CHANNEL_ID)
+            if log_channel:
+                log_embed = discord.Embed(
+                    title="🎰 Spin Win",
+                    description=f"{ctx.author.mention} won **{reward['name']}**",
+                    color=SPIN_GOLD,
+                )
+                try:
+                    await log_channel.send(embed=log_embed)
+                except discord.HTTPException:
+                    pass
+
+    @spin.error
+    async def spin_error(self, ctx: commands.Context, error):
+        if isinstance(error, commands.CommandOnCooldown):
+            left = _format_cooldown(error.retry_after)
             embed = discord.Embed(
-                title="🎰 ✨ V I P E R   S P I N ✨",
-                description=(
-                    "━━━━━━━━━━━━━━━━━━━━━━\n"
-                    "**Slot Machine**\n\n"
-                    "Χρήση: `!spin <bet>`\n\n"
-                    f"💰 Min bet: **{settings.SPIN_MIN_BET:,}**\n"
-                    f"💰 Max bet: **{settings.SPIN_MAX_BET:,}**\n"
-                    "━━━━━━━━━━━━━━━━━━━━━━"
-                ),
-                color=discord.Color.purple(),
+                title="⏳ Spin on Cooldown",
+                description=f"You already spun! Come back in **{left}**.",
+                color=SPIN_RED,
             )
-            return await ctx.send(embed=embed)
-
-        if bet < settings.SPIN_MIN_BET:
-            return await ctx.send(f"❌ Το minimum bet είναι **{settings.SPIN_MIN_BET:,} coins**.")
-        if bet > settings.SPIN_MAX_BET:
-            return await ctx.send(f"❌ Το maximum bet είναι **{settings.SPIN_MAX_BET:,} coins**.")
-
-        success = await economy_service.spend_coins(ctx.guild.id, ctx.author.id, bet, "GAME_BET_SPIN")
-        if not success:
-            balance = await economy_service.get_balance(ctx.guild.id, ctx.author.id)
-            return await ctx.send(
-                f"❌ **Insufficient funds.**\n💰 Balance: **{balance:,}**\n🎰 Bet: **{bet:,}**"
-            )
-
-        try:
-            result_mult, label, color_name = self.get_spin_result()
-            win_amount = int(bet * result_mult)
-
-            if win_amount > 0:
-                await economy_service.add_coins(ctx.guild.id, ctx.author.id, win_amount, "GAME_WIN_SPIN")
-
-            color_map = {
-                "Gold": discord.Color.gold(),
-                "Yellow": discord.Color.yellow(),
-                "Green": discord.Color.green(),
-                "White": discord.Color.light_gray(),
-                "Red": discord.Color.red(),
-            }
-            color = color_map.get(color_name, discord.Color.purple())
-
-            reels = [random.choice(["🍒", "🍋", "🔔", "⭐", "7️⃣", "💎"]) for _ in range(3)]
-            reel_line = "  ".join(reels)
-
-            if result_mult >= 10:
-                title = "💎 JACKPOT!"
-            elif result_mult > 1:
-                title = "🔥 BIG WIN!"
-            elif result_mult == 1:
-                title = "🤝 BREAK EVEN"
-            elif result_mult > 0:
-                title = "🎉 SMALL WIN"
-            else:
-                title = "💀 NO WIN"
-
-            net = win_amount - bet
-            net_line = f"+{net:,}" if net >= 0 else f"{net:,}"
-
-            embed = discord.Embed(
-                title=f"🎰 {title}",
-                description=(
-                    "━━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"### {reel_line}\n"
-                    "━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                    f"✨ **{label}**\n\n"
-                    f"🎯 Multiplier: **x{result_mult}**\n"
-                    f"💰 Bet: **{bet:,} coins**\n"
-                    f"💵 Payout: **{win_amount:,} coins**\n"
-                    f"📊 Net: **{net_line} coins**"
-                ),
-                color=color,
-            )
-            embed.set_thumbnail(url=ctx.author.display_avatar.url)
-            embed.set_footer(text="Viper Project • Spin the wheel")
-
-            await ctx.send(embed=embed)
-
-        except Exception as e:
-            await economy_service.add_coins(ctx.guild.id, ctx.author.id, bet, "GAME_REFUND_SPIN")
-            print(f"[SPIN ERROR] {type(e).__name__}: {e}")
-            await ctx.send("❌ Παρουσιάστηκε πρόβλημα στο Spin.\nΤο bet σου επιστράφηκε.")
+            await ctx.send(embed=embed, delete_after=10)
 
 
 async def setup(bot):
+    bot.add_view(SpinControlView())
     await bot.add_cog(GamesCog(bot))
